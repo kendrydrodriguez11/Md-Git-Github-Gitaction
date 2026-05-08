@@ -669,6 +669,226 @@ Los **GitHub Secrets** permiten almacenar credenciales y datos sensibles de form
 
 ---
 
+### Seguridad en GitHub Actions — Introducción
+
+Los workflows de GitHub Actions pueden volverse un vector de ataque si no se configuran correctamente. Existen varios riesgos que hay que conocer y tener en cuenta:
+
+- **Script Injection** — datos externos que terminan ejecutándose como código dentro del workflow.
+- **Acciones de terceros maliciosas** — Actions del Marketplace que pueden contener código dañino.
+- **Permisos excesivos** — dar más acceso del necesario a un workflow aumenta el impacto de cualquier ataque.
+
+La estrategia general es seguir el principio de **mínimo privilegio**: dar únicamente los permisos que realmente se necesitan para que el workflow funcione. Así, incluso si ocurre una inyección de scripts o se usa una Action maliciosa, el daño potencial queda limitado.
+
+> Consulta la documentación oficial para profundizar: buscar *"GitHub Actions security guides"* en [docs.github.com](https://docs.github.com)
+
+---
+
+### Script Injection (Inyección de scripts)
+
+La **inyección de scripts** ocurre cuando información externa entra al workflow y termina ejecutándose como código. Es uno de los problemas de seguridad más importantes en GitHub Actions.
+
+**Ejemplo vulnerable:** un workflow que se activa cuando alguien crea un issue y usa el título del issue directamente dentro de un comando `run`:
+
+```yaml
+run: |
+  issue_title="${{ github.event.issue.title }}"
+```
+
+El valor del título se inserta directamente en el comando de shell. Si el usuario escribe caracteres especiales, puede cerrar las comillas e inyectar comandos adicionales. Por ejemplo, un atacante podría crear un issue con este título:
+
+```txt
+A"; echo got your secrets "
+```
+
+Eso haría que el workflow ejecutara comandos adicionales no previstos. Aunque el ejemplo solo imprime texto, un atacante real podría:
+
+- Robar secretos del workflow.
+- Enviar variables sensibles a otro servidor usando `curl`.
+- Leer archivos del repositorio.
+- Modificar configuraciones.
+- Usar la API de GitHub para hacer cambios.
+
+**Solución correcta:** almacenar los datos externos en variables de entorno en lugar de insertarlos directamente en el comando:
+
+```yaml
+env:
+  TITLE: ${{ github.event.issue.title }}
+
+run: |
+  echo "$TITLE"
+```
+
+Con este enfoque, el valor se trata como texto normal y no como código ejecutable.
+
+> ⚠️ Nunca confíes en datos ingresados por usuarios. Usar variables de entorno o Actions ya existentes (que manejan los datos internamente de forma segura) es siempre más seguro que insertar valores externos directamente en `run`.
+
+---
+
+### Acciones maliciosas de terceros
+
+Una Action puede ejecutar cualquier tipo de lógica dentro del workflow, lo que significa que una Action maliciosa podría:
+
+- Robar secretos del workflow.
+- Modificar el código del repositorio.
+- Borrar issues o archivos.
+- Hacer peticiones a servidores externos.
+- Ejecutar comandos peligrosos.
+
+Existen distintos niveles de confianza al elegir una Action:
+
+1. **Tus propias Actions** → Máxima seguridad. Sabes exactamente qué código se ejecuta.
+2. **Actions de creadores verificados** → Bastante seguras. Tienen una marca azul de verificación en GitHub Marketplace, lo que indica que GitHub revisó al creador manualmente.
+3. **Actions públicas de cualquier persona** → Más riesgo. GitHub no revisa automáticamente todas las Actions del Marketplace.
+
+> ⚠️ Cualquier persona puede publicar una Action en el Marketplace, incluso una maliciosa. Si usas una Action de alguien desconocido, revisa su repositorio, lee el código si es posible, y verifica si la comunidad la usa y confía en ella. Todas las Actions son open source, por lo que puedes inspeccionar el código antes de agregarlas a tus workflows.
+
+---
+
+### Permisos con `permissions`
+
+Por defecto, los workflows tienen permisos muy amplios sobre el repositorio. Puedes restringirlos usando la clave `permissions` para dar solo el acceso necesario.
+
+**Ejemplo — workflow que solo necesita modificar issues:**
+```yaml
+permissions:
+  issues: write
+```
+
+Con esto, el workflow no podrá acceder al código, modificar pull requests ni cambiar otras configuraciones del repositorio.
+
+Aplicar permisos mínimos reduce el impacto de posibles ataques:
+
+- Limita lo que puede hacer una Script Injection.
+- Restringe el daño que puede causar una Action maliciosa.
+- Agrega una capa extra de seguridad al pipeline.
+
+> La idea principal es seguir el principio de **mínimo privilegio**: dar únicamente los permisos que realmente se necesitan.
+
+---
+
+### GITHUB_TOKEN
+
+GitHub genera automáticamente un token secreto llamado `GITHUB_TOKEN` para autenticar las solicitudes que los workflows hacen a la API de GitHub.
+
+Este token:
+
+- No necesitas crearlo manualmente.
+- Se genera automáticamente para cada ejecución del workflow.
+- Solo existe mientras el job se está ejecutando.
+- Se elimina cuando el workflow termina.
+
+Los permisos configurados con `permissions` controlan directamente lo que puede hacer ese token. Por ejemplo:
+
+- `issues: write` → el token puede modificar issues.
+- `issues: read` → el workflow no podrá agregar etiquetas ni editar issues.
+
+Muchas Actions usan este token internamente aunque no lo veas directamente. Por ejemplo, `actions/checkout` lo usa para descargar el código del repositorio. Por eso, si limitas demasiado los permisos, algunas Actions pueden dejar de funcionar.
+
+> ⚠️ Si no configuras `permissions`, GitHub otorga permisos amplios por defecto. Puedes cambiar ese comportamiento desde la configuración del repositorio para que todos los workflows tengan permisos más restringidos desde el inicio: *Settings → Actions → General → Workflow permissions*.
+
+---
+
+### Configuración de seguridad en GitHub Actions
+
+Desde la configuración del repositorio (*Settings → Actions → General*) puedes controlar varias opciones de seguridad para los workflows:
+
+- **Crear o aprobar pull requests automáticamente** — puede ser peligroso si el workflow tiene errores o fue manipulado, porque podría aprobar cambios inseguros. Muchas veces es mejor dejar esas acciones solo para humanos.
+- **Aprobación de workflows desde forks** — las pull requests provenientes de forks son un riesgo porque cualquier persona puede modificar código o workflows en su fork y enviar cambios potencialmente maliciosos. GitHub permite exigir aprobación manual antes de ejecutar esos workflows.
+- **Restricción de Actions permitidas** — puedes controlar qué Actions pueden usarse en el repositorio:
+  - Permitir todas las Actions.
+  - Permitir solo Actions propias.
+  - Restringir o bloquear Actions externas.
+  - Desactivar GitHub Actions completamente.
+
+---
+
+### Conexión con servicios externos y OpenID Connect (OIDC)
+
+Cuando un workflow necesita conectarse con servicios externos como AWS, el método tradicional era usar claves estáticas (`ACCESS_KEY_ID` y `SECRET_ACCESS_KEY`) guardadas como secrets en GitHub. Sin embargo, este enfoque tiene varios problemas:
+
+- Las claves pueden ser robadas si ocurre una Script Injection.
+- Hay que configurarlas manualmente en cada repositorio.
+- Muchas veces esas claves tienen más permisos de los necesarios.
+- Dar acceso completo a servicios externos de forma permanente es inseguro.
+
+La solución recomendada es usar **OpenID Connect (OIDC)**:
+
+| | Claves estáticas | OpenID Connect (OIDC) |
+|---|---|---|
+| **Duración** | Permanentes | Temporales (solo durante el job) |
+| **Almacenamiento** | Secrets en GitHub | No se almacenan |
+| **Permisos** | Fijos, generalmente amplios | Dinámicos, solo los necesarios |
+| **Riesgo de robo** | Alto | Muy bajo |
+
+Con OIDC, el workflow solicita permisos dinámicamente cuando los necesita, obtiene credenciales temporales y accede al servicio externo sin necesidad de claves permanentes. Este sistema funciona con AWS, Azure, Google Cloud y otros proveedores.
+
+> 💡 OIDC es la forma recomendada actualmente para conectar GitHub Actions con servicios externos.
+
+---
+
+### Configurar OIDC con AWS
+
+Para integrar GitHub Actions con AWS usando OpenID Connect se necesitan configurar ambos lados:
+
+**En AWS (IAM):**
+1. Crear un **proveedor de identidad OIDC** usando la URL oficial de GitHub y la audiencia correspondiente.
+2. Crear un **rol de IAM** con los permisos necesarios (por ejemplo, acceso a S3) y vincularlo al proveedor OIDC de GitHub.
+
+**En el bucket S3 (si se despliega un sitio estático):**
+- Crear el bucket con un nombre único en la región deseada (por ejemplo `us-east-1`).
+- Habilitar el hosting de sitio web estático y configurar `index.html` como archivo principal.
+- Configurar una bucket policy que permita el acceso de lectura público.
+
+**En el workflow de GitHub Actions:**
+
+En lugar de usar secrets con claves estáticas, se usa la action oficial `configure-aws-credentials` con los permisos OIDC:
+
+```yaml
+permissions:
+  id-token: write    # requerido para autenticación OIDC
+  contents: read     # requerido para clonar el repositorio
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configurar credenciales AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::<account-id>:role/<nombre-del-rol>
+          aws-region: us-east-1
+
+      - name: Desplegar a S3
+        run: aws s3 sync ./dist s3://my-bucket --region us-east-1
+```
+
+| Permiso | Por qué se necesita |
+|---|---|
+| `id-token: write` | Permite que el workflow solicite el token OIDC a GitHub |
+| `contents: read` | Permite que `actions/checkout` clone el repositorio |
+
+> ⚠️ Con OIDC el workflow ya no necesita secrets permanentes de AWS. Obtiene credenciales temporales en el momento de ejecutarse y estas se eliminan automáticamente cuando el job termina.
+
+---
+
+### Buenas prácticas de seguridad
+
+Resumen de los principios clave para proteger los workflows de GitHub Actions:
+
+- **Usar secrets siempre** para datos sensibles — nunca escribir credenciales directamente en el código del workflow.
+- **Aplicar el principio de mínimo privilegio** — configurar `permissions` con solo el acceso necesario y no dejar permisos amplios por defecto.
+- **Sanitizar inputs externos** — nunca insertar datos del usuario directamente en comandos `run`. Usar variables de entorno en su lugar.
+- **Evaluar las Actions de terceros** — usar solo Actions propias o de creadores verificados. Revisar el código de Actions desconocidas antes de agregarlas.
+- **Fijar Actions a versiones específicas** — usar `@v3` o incluso el hash exacto del commit para evitar que actualizaciones inesperadas rompan la seguridad del pipeline.
+- **Controlar los workflows desde forks** — exigir aprobación manual para evitar que código externo acceda a secrets o ejecute acciones maliciosas.
+- **Usar OpenID Connect (OIDC)** para conectarse con servicios externos en lugar de claves estáticas de larga duración.
+
+> Documentación oficial recomendada: buscar *"Security hardening for GitHub Actions"* en [docs.github.com](https://docs.github.com)
+
+---
+
 ### Acciones personalizadas (Custom Actions)
 
 Las **acciones personalizadas** sirven para simplificar workflows, reutilizar lógica y evitar repetir pasos en diferentes pipelines. Pueden crearse cuando no existe una solución disponible en el Marketplace, se necesita lógica específica, o se quiere automatizar procesos personalizados. También pueden compartirse con la comunidad como proyectos open source.
@@ -1040,6 +1260,9 @@ git push --follow-tags
 | **Output** | Valor simple que un job expone para que otros jobs dependientes lo reutilicen |
 | **Caché** | Carpeta almacenada entre ejecuciones para evitar reinstalar dependencias innecesariamente |
 | **Secret** | Credencial almacenada de forma segura en GitHub y accesible con `${{ secrets.NOMBRE }}` |
+| **`permissions`** | Clave para restringir los permisos del `GITHUB_TOKEN` al mínimo necesario |
+| **GITHUB_TOKEN** | Token temporal generado automáticamente por GitHub para cada ejecución del workflow |
+| **OIDC** | Sistema para obtener credenciales temporales de servicios externos sin usar claves estáticas |
 | **Acción compuesta** | Agrupa pasos reutilizables de workflow en un bloque invocable con `uses`, sin código |
 | **Acción JavaScript** | Acción personalizada que ejecuta lógica con Node.js y `@actions/core` |
 | **Acción Docker** | Acción personalizada que ejecuta código en un contenedor Docker con cualquier lenguaje |
@@ -1204,3 +1427,59 @@ jobs:
         run: echo "${{ steps.deploy.outputs.website-url }}"
 ```
 
+---
+
+### Ejemplo avanzado: Deploy a AWS S3 con OIDC
+
+```yaml
+name: Deploy to S3 via OIDC
+on: push
+
+permissions:
+  id-token: write    # requerido para autenticación OIDC
+  contents: read     # requerido para clonar el repositorio
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      script-file: ${{ steps.publish.outputs.script-file }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+      - uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: deps-${{ hashFiles('package-lock.json') }}
+      - run: npm ci
+      - run: npm run build
+      - id: publish
+        run: |
+          FILENAME=$(ls dist/assets/*.js | head -1)
+          echo "script-file=$FILENAME" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v3
+        with:
+          name: dist-files
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/download-artifact@v3
+        with:
+          name: dist-files
+          path: ./dist
+      - name: Configurar credenciales AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::<account-id>:role/<nombre-del-rol>
+          aws-region: us-east-1
+      - name: Desplegar a S3
+        run: aws s3 sync ./dist s3://my-s3-bucket --region us-east-1
+      - name: Mostrar archivo principal
+        run: echo "${{ needs.build.outputs.script-file }}"
+```
