@@ -644,6 +644,387 @@ Configurarlo en: *Settings → Developer settings → Personal access tokens*
 
 ---
 
+### GitHub Secrets
+
+Los **GitHub Secrets** permiten almacenar credenciales y datos sensibles de forma segura en el repositorio para que los workflows puedan usarlos sin exponerlos en el código.
+
+> ⚠️ Nunca escribas credenciales directamente en el código del workflow. Cualquier persona con acceso al repositorio podría verlas.
+
+**Configurar secrets:**
+*Settings → Secrets and variables → Actions → New repository secret*
+
+**Usar secrets en un workflow:**
+```yaml
+- name: Desplegar a S3
+  uses: ./.github/actions/deploy-s3-javascript
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  with:
+    bucket: my-bucket
+    dist-folder: ./dist
+```
+
+> AWS CLI y el SDK de Python (`boto3`) detectan automáticamente las variables de entorno `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY` para autenticar las solicitudes hacia AWS.
+
+---
+
+### Acciones personalizadas (Custom Actions)
+
+Las **acciones personalizadas** sirven para simplificar workflows, reutilizar lógica y evitar repetir pasos en diferentes pipelines. Pueden crearse cuando no existe una solución disponible en el Marketplace, se necesita lógica específica, o se quiere automatizar procesos personalizados. También pueden compartirse con la comunidad como proyectos open source.
+
+Existen tres tipos:
+
+| Tipo | Lenguaje / Entorno | Cuándo usarlo |
+|---|---|---|
+| **Compuesta** | Solo pasos YAML (sin código) | Para agrupar pasos repetitivos de workflow sin programar |
+| **JavaScript** | Node.js + paquete `@actions/core` | Para lógica compleja aprovechando el ecosistema npm |
+| **Docker** | Cualquier lenguaje dentro de un contenedor | Para máxima flexibilidad o cuando necesitas un entorno específico |
+
+> Las acciones se guardan en `.github/actions/<nombre>/action.yml` dentro del repositorio, o en un repositorio separado para reutilizarlas entre proyectos.
+
+---
+
+### Inputs en acciones personalizadas
+
+Todos los tipos de acciones pueden aceptar entradas (`inputs`) para hacerlas configurables y reutilizables. Los inputs se definen en `action.yml` bajo la clave `inputs`, al mismo nivel que `name`, `description` y `runs`.
+
+```yaml
+inputs:
+  bucket:
+    description: 'Nombre del bucket S3 donde se subirán los archivos'
+    required: true
+  bucket-region:
+    description: 'Región de AWS donde está creado el bucket'
+    required: false
+    default: 'us-east-1'
+  dist-folder:
+    description: 'Carpeta con los archivos compilados a desplegar'
+    required: true
+  caching:
+    description: 'Si se deben usar dependencias almacenadas en caché'
+    required: false
+    default: 'true'
+```
+
+| Campo | Descripción |
+|---|---|
+| `description` | Explica para qué sirve el input |
+| `required: true` | La acción falla si no se envía el valor |
+| `required: false` | La acción sigue funcionando aunque no se envíe el valor |
+| `default` | Valor usado cuando no se envía ninguno |
+
+**Enviar inputs al usar la acción en un workflow:**
+```yaml
+- name: Desplegar
+  uses: ./.github/actions/deploy-s3-javascript
+  with:
+    bucket: my-bucket
+    bucket-region: us-east-1
+    dist-folder: ./dist
+    caching: 'false'    # sobreescribe el valor por defecto
+```
+
+---
+
+### Outputs en acciones personalizadas
+
+Las acciones personalizadas pueden devolver valores al workflow mediante `outputs`, declarados también en `action.yml`:
+
+```yaml
+outputs:
+  website-url:
+    description: 'URL pública del sitio web desplegado'
+```
+
+**Consumir el output en el workflow:**
+```yaml
+steps:
+  - name: Desplegar a S3
+    id: deploy                     # el step necesita un id
+    uses: ./.github/actions/deploy-s3-javascript
+    with:
+      bucket: my-bucket
+      dist-folder: ./dist
+
+  - name: Mostrar URL desplegada
+    run: echo "${{ steps.deploy.outputs.website-url }}"
+```
+
+> Cómo se asigna el valor del output varía según el tipo de acción. Ver las secciones de cada tipo a continuación.
+
+---
+
+### Acciones compuestas (Composite Actions)
+
+Agrupan múltiples pasos de workflow en un bloque reutilizable invocable con `uses`. No requieren escribir código en ningún lenguaje: solo combinan comandos `run` y otras actions como si fueran steps normales de un workflow.
+
+**Estructura de archivos:**
+```
+.github/
+  actions/
+    cached-deps/
+      action.yml
+```
+
+**Ejemplo de `action.yml`:**
+```yaml
+name: 'Install & Cache Dependencies'
+description: 'Instala dependencias de Node.js con soporte opcional de caché'
+
+inputs:
+  caching:
+    description: 'Si se debe usar caché de dependencias'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Cachear dependencias
+      if: inputs.caching == 'true'
+      uses: actions/cache@v3
+      with:
+        path: ~/.npm
+        key: deps-${{ hashFiles('package-lock.json') }}
+
+    - name: Instalar dependencias
+      if: inputs.caching != 'true' || steps.cache.outputs.cache-hit != 'true'
+      run: npm ci
+      shell: bash
+```
+
+**Usar la acción compuesta en un workflow:**
+```yaml
+- uses: actions/checkout@v3
+- uses: actions/setup-node@v3
+  with:
+    node-version: 18
+- name: Instalar y cachear dependencias
+  uses: ./.github/actions/cached-deps
+  with:
+    caching: 'false'    # desactiva el caché solo en este job
+```
+
+> ⚠️ En acciones compuestas cada step con `run` debe incluir explícitamente `shell: bash` (u otro shell), ya que no se hereda del runner como en los workflows normales.
+
+---
+
+### Acciones JavaScript
+
+Implementan lógica usando Node.js y el paquete oficial `@actions/core`. Permiten leer inputs, generar outputs, ejecutar comandos de terminal e interactuar con la API de GitHub.
+
+**Estructura de archivos:**
+```
+.github/
+  actions/
+    deploy-s3-javascript/
+      action.yml
+      main.js
+      package.json
+```
+
+**Ejemplo de `action.yml`:**
+```yaml
+name: 'Deploy to S3 (JavaScript)'
+description: 'Despliega archivos compilados a AWS S3 usando Node.js'
+
+inputs:
+  bucket:
+    description: 'Nombre del bucket S3'
+    required: true
+  bucket-region:
+    description: 'Región de AWS'
+    required: false
+    default: 'us-east-1'
+  dist-folder:
+    description: 'Carpeta con los archivos compilados'
+    required: true
+
+outputs:
+  website-url:
+    description: 'URL pública del sitio web desplegado'
+
+runs:
+  using: 'node16'
+  main: 'main.js'
+```
+
+**Ejemplo de `main.js`:**
+```javascript
+const core = require('@actions/core');
+const exec = require('@actions/exec');
+
+async function run() {
+  // Leer inputs
+  const bucket = core.getInput('bucket', { required: true });
+  const bucketRegion = core.getInput('bucket-region', { required: true });
+  const distFolder = core.getInput('dist-folder', { required: true });
+
+  // Ejecutar comando AWS CLI (preinstalada en runners de Ubuntu)
+  const s3Uri = `s3://${bucket}`;
+  await exec.exec(`aws s3 sync ${distFolder} ${s3Uri} --region ${bucketRegion}`);
+
+  // Exponer output
+  const websiteUrl = `http://${bucket}.s3-website-${bucketRegion}.amazonaws.com`;
+  core.setOutput('website-url', websiteUrl);
+}
+
+run();
+```
+
+| Método | Descripción |
+|---|---|
+| `core.getInput('nombre')` | Lee el valor de un input definido en `action.yml` |
+| `core.setOutput('nombre', valor)` | Expone un valor como output para el workflow |
+| `exec.exec('comando')` | Ejecuta un comando de terminal desde JavaScript |
+| `core.setFailed('mensaje')` | Marca la acción como fallida con un mensaje de error |
+
+> El paquete `@actions/github` permite además acceder al cliente Octokit para comunicarse con la API de GitHub.
+
+---
+
+### Acciones Docker
+
+Ejecutan código dentro de un contenedor Docker, lo que permite usar cualquier lenguaje de programación y controlar completamente el entorno con todas las dependencias necesarias.
+
+**Estructura de archivos:**
+```
+.github/
+  actions/
+    deploy-s3-docker/
+      action.yml
+      Dockerfile
+      deploy.py
+      requirements.txt
+```
+
+**Ejemplo de `action.yml`:**
+```yaml
+name: 'Deploy to S3 (Docker)'
+description: 'Despliega archivos compilados a AWS S3 usando Python'
+
+inputs:
+  bucket:
+    description: 'Nombre del bucket S3'
+    required: true
+  bucket-region:
+    description: 'Región de AWS'
+    required: false
+    default: 'us-east-1'
+  dist-folder:
+    description: 'Carpeta con los archivos compilados'
+    required: true
+
+outputs:
+  website-url:
+    description: 'URL pública del sitio desplegado'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'    # construye la imagen desde el Dockerfile local
+                         # alternativa: usar una imagen pública de Docker Hub
+```
+
+**Ejemplo de `Dockerfile`:**
+```dockerfile
+FROM python:3
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY deploy.py .
+
+CMD ["python", "/deploy.py"]
+```
+
+**Acceder a inputs desde Python:**
+
+GitHub Actions crea automáticamente variables de entorno con el formato `INPUT_<NOMBRE_DEL_INPUT>` (en mayúsculas):
+
+```python
+import os
+import boto3
+
+bucket        = os.environ['INPUT_BUCKET']
+bucket_region = os.environ['INPUT_BUCKET_REGION']
+dist_folder   = os.environ['INPUT_DIST_FOLDER']
+```
+
+**Establecer outputs desde Python:**
+```python
+website_url = f"http://{bucket}.s3-website-{bucket_region}.amazonaws.com"
+print(f"::set-output name=website-url::{website_url}")
+```
+
+**Flujo completo de una acción Docker:**
+```
+1. GitHub Actions lee action.yml
+2. Construye una imagen Docker usando el Dockerfile
+3. Inicia un contenedor
+4. Inyecta inputs como variables de entorno INPUT_*
+5. Ejecuta el script (Python, Go, Ruby, etc.)
+6. El script realiza la tarea y establece outputs
+7. El workflow consume los outputs en steps posteriores
+```
+
+> Las credenciales AWS siguen siendo necesarias también en acciones Docker. El SDK `boto3` detecta automáticamente las variables de entorno `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY` para autenticar las solicitudes hacia S3.
+
+---
+
+### Diferencia entre tipos de acciones personalizadas
+
+| | Compuesta | JavaScript | Docker |
+|---|---|---|---|
+| **Lenguaje** | Solo YAML | Node.js | Cualquiera |
+| **Código requerido** | No | Sí | Sí |
+| **Velocidad de inicio** | Rápida | Rápida | Más lenta (build de imagen) |
+| **Flexibilidad de entorno** | Baja | Media | Alta |
+| **Leer inputs** | `inputs.<nombre>` en YAML | `core.getInput()` | Variable `INPUT_<NOMBRE>` |
+| **Escribir outputs** | `echo "nombre=valor" >> $GITHUB_OUTPUT` | `core.setOutput()` | `print("::set-output name=...")` |
+| **Ideal para** | Reutilizar pasos sin programar | Lógica con Node.js y npm | Entornos personalizados o lenguajes distintos a JS |
+
+---
+
+### Acciones en repositorios separados
+
+Las acciones personalizadas no tienen que estar en el mismo repositorio del workflow. Pueden guardarse en repositorios independientes para reutilizarlas en múltiples proyectos o compartirlas públicamente.
+
+**Flujo para publicar una acción en su propio repositorio:**
+
+```bash
+# 1. Crear el proyecto local con action.yml y el código en la raíz (sin .github/actions/)
+# 2. Inicializar Git
+git init
+
+# 3. Agregar y confirmar los archivos
+git add .
+git commit -m "Initial release"
+
+# 4. Conectar con GitHub
+git remote add origin https://github.com/usuario/mi-accion.git
+
+# 5. Crear una etiqueta de versión
+git tag -a -m "My action release" v1
+
+# 6. Subir código y etiquetas
+git push --follow-tags
+```
+
+**Usar la acción desde otro repositorio:**
+```yaml
+- name: Desplegar
+  uses: my-account/my-action@v1    # usuario/repositorio@versión
+  with:
+    bucket: my-bucket
+    dist-folder: ./dist
+```
+
+> Si la acción está en un repositorio público, puede publicarse en el **GitHub Actions Marketplace** para que otros desarrolladores la descubran e instalen fácilmente.
+> Guía oficial: [docs.github.com — Publishing Actions in GitHub Marketplace](https://docs.github.com/en/actions/creating-actions/publishing-actions-in-github-marketplace)
+
+---
+
 ### Resumen de bloques de GitHub Actions
 
 | Elemento | Descripción |
@@ -658,10 +1039,51 @@ Configurarlo en: *Settings → Developer settings → Personal access tokens*
 | **Artefacto** | Archivo o carpeta generado por un job que se guarda para su descarga o reutilización |
 | **Output** | Valor simple que un job expone para que otros jobs dependientes lo reutilicen |
 | **Caché** | Carpeta almacenada entre ejecuciones para evitar reinstalar dependencias innecesariamente |
+| **Secret** | Credencial almacenada de forma segura en GitHub y accesible con `${{ secrets.NOMBRE }}` |
+| **Acción compuesta** | Agrupa pasos reutilizables de workflow en un bloque invocable con `uses`, sin código |
+| **Acción JavaScript** | Acción personalizada que ejecuta lógica con Node.js y `@actions/core` |
+| **Acción Docker** | Acción personalizada que ejecuta código en un contenedor Docker con cualquier lenguaje |
 
 ---
 
-### Ejemplo completo: Lint, Test & Deploy con caché y artefactos
+### Ejemplos de workflows básicos
+
+**Workflow 1 — Un solo job**
+```yaml
+name: Ejercicio de Despliegue
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test
+      - run: npm run build
+      - run: echo "Desplegando..."
+```
+
+**Workflow 2 — Issues**
+```yaml
+name: Manejar Issues
+on: issues
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mostrar detalles del evento
+        run: echo "${{ toJSON(github.event) }}"
+```
+
+> Este workflow se activa cuando ocurre cualquier acción relacionada con issues (crear, editar, cerrar, etc.). Para probarlo, crea un issue en el repositorio; no se activa con push.
+
+---
+
+### Ejemplo avanzado: Lint, Test & Deploy con caché y artefactos
 
 ```yaml
 name: Deploy Website
@@ -728,37 +1150,57 @@ jobs:
 
 ---
 
-### Ejemplo: Workflows de ejercicio
+### Ejemplo avanzado: Deploy a AWS S3 con acción personalizada JavaScript
 
-**Workflow 1 — Un solo job**
 ```yaml
-name: Ejercicio de Despliegue
+name: Deploy to S3
 on: push
+
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      script-file: ${{ steps.publish.outputs.script-file }}
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
         with:
           node-version: 18
+      - uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: deps-${{ hashFiles('package-lock.json') }}
       - run: npm ci
-      - run: npm run lint
-      - run: npm run test
       - run: npm run build
-      - run: echo "Desplegando..."
-```
+      - id: publish
+        run: |
+          FILENAME=$(ls dist/assets/*.js | head -1)
+          echo "script-file=$FILENAME" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v3
+        with:
+          name: dist-files
+          path: dist
 
-**Workflow 2 — Issues**
-```yaml
-name: Manejar Issues
-on: issues
-jobs:
-  info:
+  deploy:
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Mostrar detalles del evento
-        run: echo "${{ toJSON(github.event) }}"
+      - uses: actions/checkout@v3
+      - uses: actions/download-artifact@v3
+        with:
+          name: dist-files
+          path: ./dist
+      - name: Desplegar a S3
+        id: deploy
+        uses: ./.github/actions/deploy-s3-javascript
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        with:
+          bucket: my-s3-bucket
+          bucket-region: us-east-1
+          dist-folder: ./dist
+      - name: Mostrar URL del sitio
+        run: echo "${{ steps.deploy.outputs.website-url }}"
 ```
 
-> Este workflow se activa cuando ocurre cualquier acción relacionada con issues (crear, editar, cerrar, etc.). Para probarlo, crea un issue en el repositorio; no se activa con push.
